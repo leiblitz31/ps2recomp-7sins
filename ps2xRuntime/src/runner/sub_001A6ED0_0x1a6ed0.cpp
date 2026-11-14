@@ -1,0 +1,68 @@
+#include <stdexcept>
+#include "ps2_runtime_macros.h"
+#include "ps2_runtime.h"
+#include <ps2_recompiled_functions.h>
+#include <ps2_recompiled_stubs.h>
+
+#include "ps2_syscalls.h"
+#include "ps2_stubs.h"
+
+#ifdef PS2_FUNCTION_LOG_TRACKER
+#include "ps2_log.h"
+#endif
+
+// Function: sub_001A6ED0
+// Address: 0x1a6ed0 - 0x1a6f00
+void sub_001A6ED0_0x1a6ed0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("sub_001A6ED0_0x1a6ed0");
+#endif
+
+    ctx->pc = 0x1a6ed0u;
+
+    // 0x1a6ed0: 0x27bdffe0  addiu       $sp, $sp, -0x20
+    ctx->pc = 0x1a6ed0u;
+    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967264));
+    // 0x1a6ed4: 0xafa40000  sw          $a0, 0x0($sp)
+    ctx->pc = 0x1a6ed4u;
+    WRITE32(ADD32(GPR_U32(ctx, 29), 0), GPR_U32(ctx, 4));
+    // 0x1a6ed8: 0xafa50010  sw          $a1, 0x10($sp)
+    ctx->pc = 0x1a6ed8u;
+    WRITE32(ADD32(GPR_U32(ctx, 29), 16), GPR_U32(ctx, 5));
+    // 0x1a6edc: 0x8fa40010  lw          $a0, 0x10($sp)
+    ctx->pc = 0x1a6edcu;
+    SET_GPR_S32(ctx, 4, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 16)));
+    // 0x1a6ee0: 0x8fa30000  lw          $v1, 0x0($sp)
+    ctx->pc = 0x1a6ee0u;
+    SET_GPR_S32(ctx, 3, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 0)));
+    // 0x1a6ee4: 0xac640004  sw          $a0, 0x4($v1)
+    ctx->pc = 0x1a6ee4u;
+    WRITE32(ADD32(GPR_U32(ctx, 3), 4), GPR_U32(ctx, 4));
+    // 0x1a6ee8: 0x27bd0020  addiu       $sp, $sp, 0x20
+    ctx->pc = 0x1a6ee8u;
+    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 32));
+    // 0x1a6eec: 0x3e00008  jr          $ra
+    ctx->pc = 0x1A6EECu;
+    {
+        const uint32_t jumpTarget = GPR_U32(ctx, 31);
+        ctx->pc = jumpTarget;
+        #if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS
+        (void)runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x1A6EECu, 0u, PS2Runtime::GuestBranchKind::Return, "JR $ra");
+        return;
+        #else
+        ctx->pc = jumpTarget;
+        return;
+        #endif
+    }
+    ctx->pc = 0x1A6EF4u;
+    // 0x1a6ef4: 0x0  nop
+    ctx->pc = 0x1a6ef4u;
+    // NOP
+    // 0x1a6ef8: 0x0  nop
+    ctx->pc = 0x1a6ef8u;
+    // NOP
+    // 0x1a6efc: 0x0  nop
+    ctx->pc = 0x1a6efcu;
+    // NOP
+    ctx->pc = 0x1a6f00u;
+}

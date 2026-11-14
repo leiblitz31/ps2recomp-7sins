@@ -1,0 +1,91 @@
+#include <stdexcept>
+#include "ps2_runtime_macros.h"
+#include "ps2_runtime.h"
+#include <ps2_recompiled_functions.h>
+#include <ps2_recompiled_stubs.h>
+
+#include "ps2_syscalls.h"
+#include "ps2_stubs.h"
+
+#ifdef PS2_FUNCTION_LOG_TRACKER
+#include "ps2_log.h"
+#endif
+
+// Function: sub_00247BF0
+// Address: 0x247bf0 - 0x247c30
+void sub_00247BF0_0x247bf0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {
+#ifdef PS2_FUNCTION_LOG_TRACKER
+    PS_LOG_ENTRY("sub_00247BF0_0x247bf0");
+#endif
+
+    switch (ctx->pc) {
+        case 0x247c08u: goto label_247c08;
+        case 0x247c1cu: goto label_247c1c;
+        default: break;
+    }
+
+    ctx->pc = 0x247bf0u;
+
+    // 0x247bf0: 0x27bdffd0  addiu       $sp, $sp, -0x30
+    ctx->pc = 0x247bf0u;
+    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967248));
+    // 0x247bf4: 0xffbf0000  sd          $ra, 0x0($sp)
+    ctx->pc = 0x247bf4u;
+    WRITE64(ADD32(GPR_U32(ctx, 29), 0), GPR_U64(ctx, 31));
+    // 0x247bf8: 0xafa40020  sw          $a0, 0x20($sp)
+    ctx->pc = 0x247bf8u;
+    WRITE32(ADD32(GPR_U32(ctx, 29), 32), GPR_U32(ctx, 4));
+    // 0x247bfc: 0x27a40018  addiu       $a0, $sp, 0x18
+    ctx->pc = 0x247bfcu;
+    SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 29), 24));
+    // 0x247c00: 0xc091f8c  jal         func_247E30
+    ctx->pc = 0x247C00u;
+    SET_GPR_U32(ctx, 31, 0x247C08u);
+    ctx->pc = 0x247E30u;
+    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x247E30u, 0x247C00u, 0x247C08u, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
+        return;
+    }
+    ctx->pc = 0x247C08u;
+label_247c08:
+    // 0x247c08: 0x8fa40020  lw          $a0, 0x20($sp)
+    ctx->pc = 0x247c08u;
+    SET_GPR_S32(ctx, 4, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 32)));
+    // 0x247c0c: 0x27a5001c  addiu       $a1, $sp, 0x1C
+    ctx->pc = 0x247c0cu;
+    SET_GPR_S32(ctx, 5, (int32_t)ADD32(GPR_U32(ctx, 29), 28));
+    // 0x247c10: 0x40302d  daddu       $a2, $v0, $zero
+    ctx->pc = 0x247c10u;
+    SET_GPR_U64(ctx, 6, (uint64_t)GPR_U64(ctx, 2) + (uint64_t)GPR_U64(ctx, 0));
+    // 0x247c14: 0xc091f0c  jal         func_247C30
+    ctx->pc = 0x247C14u;
+    SET_GPR_U32(ctx, 31, 0x247C1Cu);
+    ctx->pc = 0x247C30u;
+    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x247C30u, 0x247C14u, 0x247C1Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL")) {
+        return;
+    }
+    ctx->pc = 0x247C1Cu;
+label_247c1c:
+    // 0x247c1c: 0x8fa20020  lw          $v0, 0x20($sp)
+    ctx->pc = 0x247c1cu;
+    SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 32)));
+    // 0x247c20: 0xdfbf0000  ld          $ra, 0x0($sp)
+    ctx->pc = 0x247c20u;
+    SET_GPR_U64(ctx, 31, READ64(ADD32(GPR_U32(ctx, 29), 0)));
+    // 0x247c24: 0x27bd0030  addiu       $sp, $sp, 0x30
+    ctx->pc = 0x247c24u;
+    SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 48));
+    // 0x247c28: 0x3e00008  jr          $ra
+    ctx->pc = 0x247C28u;
+    {
+        const uint32_t jumpTarget = GPR_U32(ctx, 31);
+        ctx->pc = jumpTarget;
+        #if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS
+        (void)runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x247C28u, 0u, PS2Runtime::GuestBranchKind::Return, "JR $ra");
+        return;
+        #else
+        ctx->pc = jumpTarget;
+        return;
+        #endif
+    }
+    ctx->pc = 0x247C30u;
+}

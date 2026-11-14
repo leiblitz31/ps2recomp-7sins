@@ -1,0 +1,1095 @@
+// R5900 (EE) interpreter used as a fallback for guest addresses that Ghidra
+// did not turn into recompiled functions (boot stubs, thunks, analysis gaps).
+//
+// Design: dispatching a missing address runs this interpreter instead of
+// reporting a missing function. It executes instructions in a loop and hands
+// control back as soon as the PC reaches an address that has a recompiled
+// function table entry, so only the uncovered gaps run slowly.
+//
+// Coverage: integer core, MIPS branch/jump forms (incl. "likely" variants and
+// COP0-conditional REGIMM branches), loads/stores (byte/half/word/dword/
+// 128-bit plus unaligned lwl/lwr/swl/swr/ldl/ldr), mult/div, 64-bit shifts,
+// COP0 (mfc0/mtc0/cfc0/ctc0/eret/ei/di), COP1 data movement + arithmetic,
+// and syscalls routed through PS2Runtime::handleSyscall.
+// Anything else is logged once per (address, instruction) and executed as a
+// NOP, so booting proceeds and the log names exactly what is still missing.
+
+#include "ps2_ee_interpreter.h"
+
+#include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
+#include "ps2_syscalls.h"
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <unordered_set>
+
+namespace ps2_ee_interpreter
+{
+namespace
+{
+std::atomic<uint64_t> g_interpreted{0u};
+std::atomic<uint64_t> g_unsupported{0u};
+
+constexpr uint32_t kMaxInsnsPerThunk = 100000u;
+constexpr size_t kUnsupportedLogCap = 2048u;
+
+struct Field
+{
+    uint32_t op;
+    uint32_t rs;
+    uint32_t rt;
+    uint32_t rd;   // bits 15-11
+    uint32_t sa;   // bits 10-6
+    uint32_t fn;   // bits 5-0
+    uint32_t uimm; // zero-extended 16
+    int32_t simm;  // sign-extended 16
+};
+
+Field decode(uint32_t w)
+{
+    Field f{};
+    f.op = (w >> 26) & 0x3fu;
+    f.rs = (w >> 21) & 0x1fu;
+    f.rt = (w >> 16) & 0x1fu;
+    f.rd = (w >> 11) & 0x1fu;
+    f.sa = (w >> 6) & 0x1fu;
+    f.fn = w & 0x3fu;
+    f.uimm = w & 0xffffu;
+    f.simm = static_cast<int32_t>(static_cast<int16_t>(static_cast<uint16_t>(w & 0xffffu)));
+    return f;
+}
+
+enum class Flow
+{
+    Sequential, // continue with pc+4
+    Branch,     // conditional branch taken: run delay slot, keep interpreting
+    Call,       // jal/jalr: run delay slot, then transfer control to the target
+    Transfer,   // jr/j/eret: run delay slot, hand control back to the scheduler
+    Syscall,    // syscall handled; ctx->pc was updated by the handler
+    Stop        // interpreter must bail out
+};
+
+void logUnsupportedOnce(uint32_t address, uint32_t insn)
+{
+    static std::mutex mtx;
+    static std::unordered_set<uint64_t> seen;
+    static bool capReached = false;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (capReached)
+    {
+        return;
+    }
+    const uint64_t key = (static_cast<uint64_t>(address) << 32) | insn;
+    if (seen.insert(key).second)
+    {
+        std::printf("[interp] unsupported insn 0x%08x @0x%08x\n", insn, address);
+        if (seen.size() >= kUnsupportedLogCap)
+        {
+            capReached = true;
+            std::printf("[interp] unsupported-insn log capped at %zu unique entries\n", kUnsupportedLogCap);
+        }
+        std::fflush(stdout);
+    }
+}
+
+uint32_t cop0Read(R5900Context *ctx, uint32_t index)
+{
+    switch (index)
+    {
+    case 0: return ctx->cop0_index;
+    case 1: return ctx->cop0_random;
+    case 2: return ctx->cop0_entrylo0;
+    case 3: return ctx->cop0_entrylo1;
+    case 4: return ctx->cop0_context;
+    case 5: return ctx->cop0_pagemask;
+    case 6: return ctx->cop0_wired;
+    case 8: return ctx->cop0_badvaddr;
+    case 9: return ctx->cop0_count;
+    case 10: return ctx->cop0_entryhi;
+    case 11: return ctx->cop0_compare;
+    case 12: return ctx->cop0_status;
+    case 13: return ctx->cop0_cause;
+    case 14: return ctx->cop0_epc;
+    case 15: return ctx->cop0_prid;
+    case 16: return ctx->cop0_config;
+    case 17: return ctx->cop0_badpaddr;
+    case 20: return ctx->cop0_context;
+    case 23: return ctx->cop0_badpaddr;
+    case 24: return ctx->cop0_debug;
+    case 28: return ctx->cop0_taglo;
+    case 29: return ctx->cop0_taghi;
+    case 30: return ctx->cop0_perf;
+    case 31: return ctx->cop0_errorepc;
+    default: return 0u;
+    }
+}
+
+void cop0Write(R5900Context *ctx, uint32_t index, uint32_t value)
+{
+    switch (index)
+    {
+    case 0: ctx->cop0_index = value; break;
+    case 2: ctx->cop0_entrylo0 = value; break;
+    case 3: ctx->cop0_entrylo1 = value; break;
+    case 4: ctx->cop0_context = value; break;
+    case 5: ctx->cop0_pagemask = value; break;
+    case 6: ctx->cop0_wired = value; break;
+    case 9: ctx->cop0_count = value; break;
+    case 10: ctx->cop0_entryhi = value; break;
+    case 11: ctx->cop0_compare = value; break;
+    case 12: ctx->cop0_status = value; break;
+    case 13: ctx->cop0_cause = value; break;
+    case 14: ctx->cop0_epc = value; break;
+    case 24: ctx->cop0_debug = value; break;
+    case 28: ctx->cop0_taglo = value; break;
+    case 29: ctx->cop0_taghi = value; break;
+    case 30: ctx->cop0_perf = value; break;
+    case 31: ctx->cop0_errorepc = value; break;
+    default: break;
+    }
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+uint64_t loadSignExt(uint32_t v) { return static_cast<uint64_t>(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v)))); }
+
+uint32_t fpuCond(R5900Context *ctx) { return (ctx->fcr31 >> 23) & 1u; }
+void setFpuCond(R5900Context *ctx, uint32_t bit) { ctx->fcr31 = (ctx->fcr31 & ~(1u << 23)) | ((bit & 1u) << 23); }
+
+// Unaligned access helpers follow the MIPS little-endian byte-packing rules.
+uint32_t lwlValue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint32_t cur)
+{
+    const uint32_t pofs = addr & 3u;
+    const uint32_t mem = runtime->Load32(rdram, ctx, addr & ~3u);
+    const uint32_t keep = (pofs == 0u) ? 0u : ((1u << (pofs * 8u)) - 1u);
+    return (cur & keep) | (mem & ~keep);
+}
+
+uint32_t lwrValue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint32_t cur)
+{
+    const uint32_t pofs = addr & 3u;
+    const uint32_t mem = runtime->Load32(rdram, ctx, addr & ~3u);
+    const uint32_t mask = (pofs == 3u) ? 0xffffffffu : ((1u << ((pofs + 1u) * 8u)) - 1u);
+    return (cur & ~mask) | (mem & mask);
+}
+
+uint64_t ldlValue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint64_t cur)
+{
+    const uint32_t pofs = addr & 7u;
+    const uint64_t mem = runtime->Load64(rdram, ctx, addr & ~7u);
+    const uint64_t keep = (pofs == 0u) ? 0ull : ((1ull << (pofs * 8u)) - 1ull);
+    return (cur & keep) | (mem & ~keep);
+}
+
+uint64_t ldrValue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint64_t cur)
+{
+    const uint32_t pofs = addr & 7u;
+    const uint64_t mem = runtime->Load64(rdram, ctx, addr & ~7u);
+    const uint64_t mask = (pofs == 7u) ? 0xffffffffffffffffull : ((1ull << ((pofs + 1u) * 8u)) - 1ull);
+    return (cur & ~mask) | (mem & mask);
+}
+
+void swlStore(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint32_t v)
+{
+    const uint32_t pofs = addr & 3u;
+    const uint32_t paddr = addr & ~3u;
+    const uint32_t mem = runtime->Load32(rdram, ctx, paddr);
+    const uint32_t mask = 0xffffffffu >> (pofs * 8u);
+    runtime->Store32(rdram, ctx, paddr, (mem & mask) | (v << (pofs * 8u)));
+}
+
+void swrStore(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint32_t v)
+{
+    const uint32_t pofs = addr & 3u;
+    const uint32_t paddr = addr & ~3u;
+    const uint32_t mem = runtime->Load32(rdram, ctx, paddr);
+    const uint32_t mask = (pofs == 3u) ? 0xffffffffu : ((1u << ((pofs + 1u) * 8u)) - 1u);
+    runtime->Store32(rdram, ctx, paddr, (mem & ~mask) | ((v >> ((3u - pofs) * 8u)) & mask));
+}
+
+void sdlStore(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint64_t v)
+{
+    const uint32_t pofs = addr & 7u;
+    const uint32_t paddr = addr & ~7u;
+    const uint64_t mem = runtime->Load64(rdram, ctx, paddr);
+    const uint64_t mask = 0xffffffffffffffffull >> (pofs * 8u);
+    runtime->Store64(rdram, ctx, paddr, (mem & mask) | (v << (pofs * 8u)));
+}
+
+void sdrStore(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint64_t v)
+{
+    const uint32_t pofs = addr & 7u;
+    const uint32_t paddr = addr & ~7u;
+    const uint64_t mem = runtime->Load64(rdram, ctx, paddr);
+    const uint64_t mask = (pofs == 7u) ? 0xffffffffffffffffull : ((1ull << ((pofs + 1u) * 8u)) - 1ull);
+    runtime->Store64(rdram, ctx, paddr, (mem & ~mask) | ((v >> ((7u - pofs) * 8u)) & mask));
+}
+} // namespace
+
+// ---- MMI / R5900 SIMD ------------------------------------------------------
+// Field layout verified against this program's own Ghidra decode (generated
+// runner comments): destination = bits 15-11, sources = bits 25-21 / 20-16,
+// sub-opcode = bits 10-6, group = bits 5-0.
+struct Packed
+{
+    int8_t b[16];
+    int16_t h[8];
+    int32_t w[4];
+    uint64_t d[2];
+};
+
+int32_t ps2_sat_add32(int32_t a, int32_t b)
+{
+    const int64_t s = static_cast<int64_t>(a) + b;
+    if (s > 0x7fffffff) return 0x7fffffff;
+    if (s < -0x80000000ll) return static_cast<int32_t>(0x80000000);
+    return static_cast<int32_t>(s);
+}
+
+int32_t ps2_sat_sub32(int32_t a, int32_t b)
+{
+    const int64_t s = static_cast<int64_t>(a) - b;
+    if (s > 0x7fffffff) return 0x7fffffff;
+    if (s < -0x80000000ll) return static_cast<int32_t>(0x80000000);
+    return static_cast<int32_t>(s);
+}
+
+int16_t ps2_sat_add16(int16_t a, int16_t b)
+{
+    const int32_t s = static_cast<int32_t>(a) + b;
+    if (s > 32767) return 32767;
+    if (s < -32768) return -32768;
+    return static_cast<int16_t>(s);
+}
+
+int16_t ps2_sat_sub16(int16_t a, int16_t b)
+{
+    const int32_t s = static_cast<int32_t>(a) - b;
+    if (s > 32767) return 32767;
+    if (s < -32768) return -32768;
+    return static_cast<int16_t>(s);
+}
+
+int8_t ps2_sat_add8(int8_t a, int8_t b)
+{
+    const int32_t s = static_cast<int32_t>(a) + b;
+    if (s > 127) return 127;
+    if (s < -128) return -128;
+    return static_cast<int8_t>(s);
+}
+
+int8_t ps2_sat_sub8(int8_t a, int8_t b)
+{
+    const int32_t s = static_cast<int32_t>(a) - b;
+    if (s > 127) return 127;
+    if (s < -128) return -128;
+    return static_cast<int8_t>(s);
+}
+
+int8_t ps2_sat_add_u8(int8_t a, int8_t b)
+{
+    const uint32_t s = static_cast<uint32_t>(static_cast<uint8_t>(a)) + static_cast<uint8_t>(b);
+    return static_cast<int8_t>(s > 255u ? 255u : s);
+}
+
+int8_t ps2_sat_sub_u8(int8_t a, int8_t b)
+{
+    const int32_t s = static_cast<int32_t>(static_cast<uint8_t>(a)) - static_cast<uint8_t>(b);
+    return static_cast<int8_t>(s < 0 ? 0 : s);
+}
+
+Packed unpack128(__m128i v)
+{
+    Packed p{};
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(&p), v);
+    return p;
+}
+
+__m128i pack128(const Packed &p)
+{
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(&p));
+}
+
+bool mmiExecute(const Field &f, R5900Context *ctx)
+{
+    Packed a = unpack128(GPR_VEC(ctx, f.rs));
+    Packed b = unpack128(GPR_VEC(ctx, f.rt));
+    Packed r{};
+    const uint32_t g = f.fn;
+    const uint32_t sa = f.sa;
+    bool handled = true;
+
+    auto finish = [&](void) { SET_GPR_VEC(ctx, f.rd, pack128(r)); };
+
+    if (g == 0x08) // MMI0
+    {
+        switch (sa)
+        {
+        case 0x00: for (int i = 0; i < 4; ++i) r.w[i] = a.w[i] + b.w[i]; break;   // paddw
+        case 0x01: for (int i = 0; i < 4; ++i) r.w[i] = a.w[i] - b.w[i]; break;   // psubw
+        case 0x02: for (int i = 0; i < 4; ++i) r.w[i] = (a.w[i] > b.w[i]) ? -1 : 0; break; // pcgtw
+        case 0x03: for (int i = 0; i < 4; ++i) r.w[i] = (a.w[i] > b.w[i]) ? a.w[i] : b.w[i]; break; // pmaxw
+        case 0x04: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(a.h[i] + b.h[i]); break; // paddh
+        case 0x05: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(a.h[i] - b.h[i]); break; // psubh
+        case 0x06: for (int i = 0; i < 8; ++i) r.h[i] = (a.h[i] > b.h[i]) ? -1 : 0; break; // pcgth
+        case 0x07: for (int i = 0; i < 8; ++i) r.h[i] = (a.h[i] > b.h[i]) ? a.h[i] : b.h[i]; break; // pmaxh
+        case 0x08: for (int i = 0; i < 16; ++i) r.b[i] = static_cast<int8_t>(a.b[i] + b.b[i]); break; // paddb
+        case 0x09: for (int i = 0; i < 16; ++i) r.b[i] = static_cast<int8_t>(a.b[i] - b.b[i]); break; // psubb
+        case 0x0a: for (int i = 0; i < 16; ++i) r.b[i] = (a.b[i] > b.b[i]) ? -1 : 0; break; // pcgtb
+        case 0x10: for (int i = 0; i < 4; ++i) r.w[i] = ps2_sat_add32(a.w[i], b.w[i]); break; // paddsw
+        case 0x11: for (int i = 0; i < 4; ++i) r.w[i] = ps2_sat_sub32(a.w[i], b.w[i]); break; // psubsw
+        case 0x12: r.w[0] = a.w[0]; r.w[1] = b.w[0]; r.w[2] = a.w[1]; r.w[3] = b.w[1]; break; // pextlw
+        case 0x13: r.w[0] = a.w[0]; r.w[1] = a.w[1]; r.w[2] = b.w[0]; r.w[3] = b.w[1]; break; // ppacw
+        case 0x14: for (int i = 0; i < 8; ++i) r.h[i] = ps2_sat_add16(a.h[i], b.h[i]); break; // paddsh
+        case 0x15: for (int i = 0; i < 8; ++i) r.h[i] = ps2_sat_sub16(a.h[i], b.h[i]); break; // psubsh
+        case 0x16: for (int i = 0; i < 4; ++i) { r.h[2 * i] = a.h[i]; r.h[2 * i + 1] = b.h[i]; } break; // pextlh
+        case 0x17: for (int i = 0; i < 4; ++i) { r.h[i] = a.h[2 * i]; r.h[i + 4] = b.h[2 * i]; } break; // ppach
+        case 0x18: for (int i = 0; i < 16; ++i) r.b[i] = ps2_sat_add8(a.b[i], b.b[i]); break; // paddsb
+        case 0x19: for (int i = 0; i < 16; ++i) r.b[i] = ps2_sat_sub8(a.b[i], b.b[i]); break; // psubsb
+        case 0x1a: for (int i = 0; i < 8; ++i) { r.b[2 * i] = a.b[i]; r.b[2 * i + 1] = b.b[i]; } break; // pextlb
+        case 0x1b: for (int i = 0; i < 8; ++i) { r.b[i] = a.b[2 * i]; r.b[i + 8] = b.b[2 * i]; } break; // ppacb
+        default: handled = false; break;
+        }
+        if (handled) { finish(); return true; }
+        return false;
+    }
+
+    if (g == 0x28) // MMI1
+    {
+        switch (sa)
+        {
+        case 0x01: for (int i = 0; i < 4; ++i) r.w[i] = a.w[i] < 0 ? -a.w[i] : a.w[i]; break; // pabsw
+        case 0x02: for (int i = 0; i < 4; ++i) r.w[i] = (a.w[i] == b.w[i]) ? -1 : 0; break;   // pceqw
+        case 0x03: for (int i = 0; i < 4; ++i) r.w[i] = (a.w[i] < b.w[i]) ? a.w[i] : b.w[i]; break; // pminw
+        case 0x04: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(a.b[i] + b.h[i]); break; // paddsbh
+        case 0x05: for (int i = 0; i < 8; ++i) r.h[i] = a.h[i] < 0 ? static_cast<int16_t>(-a.h[i]) : a.h[i]; break; // pabsh
+        case 0x06: for (int i = 0; i < 8; ++i) r.h[i] = (a.h[i] == b.h[i]) ? -1 : 0; break;   // pceqh
+        case 0x07: for (int i = 0; i < 8; ++i) r.h[i] = (a.h[i] < b.h[i]) ? a.h[i] : b.h[i]; break; // pminh
+        case 0x0a: for (int i = 0; i < 16; ++i) r.b[i] = (a.b[i] == b.b[i]) ? -1 : 0; break;  // pceqb
+        case 0x10: for (int i = 0; i < 4; ++i) r.w[i] = a.w[i] + b.w[i]; break;               // padduw
+        case 0x11: for (int i = 0; i < 4; ++i) r.w[i] = a.w[i] - b.w[i]; break;               // psubuw
+        case 0x12: r.w[0] = a.w[2]; r.w[1] = b.w[2]; r.w[2] = a.w[3]; r.w[3] = b.w[3]; break; // pextuw
+        case 0x14: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(a.h[i] + b.h[i]); break; // padduh
+        case 0x15: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(a.h[i] - b.h[i]); break; // psubuh
+        case 0x16: for (int i = 0; i < 4; ++i) { r.h[2 * i] = a.h[i + 4]; r.h[2 * i + 1] = b.h[i + 4]; } break; // pextuh
+        case 0x18: for (int i = 0; i < 16; ++i) r.b[i] = ps2_sat_add_u8(a.b[i], b.b[i]); break; // paddub
+        case 0x19: for (int i = 0; i < 16; ++i) r.b[i] = ps2_sat_sub_u8(a.b[i], b.b[i]); break; // psubub
+        case 0x1a: for (int i = 0; i < 8; ++i) { r.b[2 * i] = a.b[i + 8]; r.b[2 * i + 1] = b.b[i + 8]; } break; // pextub
+        case 0x1b:
+        {
+            const uint64_t cat = (b.d[0] >> (sa * 8u)) | (a.d[0] << (64u - sa * 8u));
+            r.d[0] = cat;
+            const uint64_t catHi = (b.d[1] >> (sa * 8u)) | (a.d[1] << (64u - sa * 8u));
+            r.d[1] = (sa == 0u) ? b.d[1] : catHi;
+            break; // qfsrv
+        }
+        default: handled = false; break;
+        }
+        if (handled) { finish(); return true; }
+        return false;
+    }
+
+    if (g == 0x09) // MMI2
+    {
+        switch (sa)
+        {
+        case 0x00: // pmaddw
+            for (int i = 0; i < 2; ++i)
+            {
+                r.w[2 * i] = static_cast<int32_t>(static_cast<int64_t>(a.w[2 * i]) * b.w[2 * i] +
+                                                  static_cast<int64_t>(a.w[2 * i + 1]) * b.w[2 * i + 1]);
+                r.w[2 * i + 1] = 0;
+            }
+            // PMADDW produces two 64-bit accumulators.
+            r.d[0] = static_cast<uint64_t>(static_cast<int64_t>(a.w[0]) * b.w[0] + static_cast<int64_t>(a.w[1]) * b.w[1]);
+            r.d[1] = static_cast<uint64_t>(static_cast<int64_t>(a.w[2]) * b.w[2] + static_cast<int64_t>(a.w[3]) * b.w[3]);
+            break;
+        case 0x02: for (int i = 0; i < 4; ++i) r.w[i] = static_cast<int32_t>(static_cast<uint32_t>(a.w[i]) << (b.w[i] & 31u)); break; // psllvw
+        case 0x03: for (int i = 0; i < 4; ++i) r.w[i] = static_cast<int32_t>(static_cast<uint32_t>(a.w[i]) >> (b.w[i] & 31u)); break; // psrlvw
+        case 0x04: // pmsubw
+            r.d[0] = static_cast<uint64_t>(static_cast<int64_t>(a.w[0]) * b.w[0] - static_cast<int64_t>(a.w[1]) * b.w[1]);
+            r.d[1] = static_cast<uint64_t>(static_cast<int64_t>(a.w[2]) * b.w[2] - static_cast<int64_t>(a.w[3]) * b.w[3]);
+            break;
+        case 0x08: { const int32_t v = static_cast<int32_t>(static_cast<uint32_t>(ctx->hi)); for (int i = 0; i < 4; ++i) r.w[i] = v; break; } // pmfhi
+        case 0x09: { const int32_t v = static_cast<int32_t>(static_cast<uint32_t>(ctx->lo)); for (int i = 0; i < 4; ++i) r.w[i] = v; break; } // pmflo
+        case 0x0a: for (int i = 0; i < 4; ++i) { r.h[i] = a.h[i]; r.h[i + 4] = b.h[i]; } break; // pinth
+        case 0x0c: // pmultw
+            for (int i = 0; i < 2; ++i)
+            {
+                const int64_t p = static_cast<int64_t>(a.w[2 * i]) * static_cast<int64_t>(b.w[2 * i]);
+                r.d[i] = static_cast<uint64_t>(p);
+            }
+            break;
+        case 0x0d: // pdivw
+            for (int i = 0; i < 2; ++i)
+            {
+                const int64_t num = static_cast<int64_t>(a.d[i]);
+                const int32_t den = b.w[2 * i + 1];
+                if (den != 0) { r.d[i] = static_cast<uint64_t>(num / den); ctx->lo = static_cast<uint64_t>(num % den); }
+                else { r.d[i] = 0u; ctx->lo = static_cast<uint64_t>(num); }
+            }
+            break;
+        case 0x0e: r.d[0] = a.d[0]; r.d[1] = b.d[0]; break; // pcpyld
+        case 0x10: // pmaddh
+            for (int i = 0; i < 2; ++i)
+            {
+                r.w[2 * i] = static_cast<int32_t>(a.h[4 * i]) * b.h[4 * i] + static_cast<int32_t>(a.h[4 * i + 1]) * b.h[4 * i + 1];
+                r.w[2 * i + 1] = static_cast<int32_t>(a.h[4 * i + 2]) * b.h[4 * i + 2] + static_cast<int32_t>(a.h[4 * i + 3]) * b.h[4 * i + 3];
+            }
+            break;
+        case 0x11: // phmadh (HIM accumulator not modelled: treated as zero)
+            for (int i = 0; i < 8; ++i)
+            {
+                r.h[i] = static_cast<int16_t>((static_cast<int32_t>(a.h[i]) * b.h[i]) >> 16);
+            }
+            break;
+        case 0x12: for (int i = 0; i < 16; ++i) r.b[i] = static_cast<int8_t>(a.b[i] & b.b[i]); break; // pand
+        case 0x13: for (int i = 0; i < 16; ++i) r.b[i] = static_cast<int8_t>(a.b[i] ^ b.b[i]); break; // pxor
+        case 0x14: // pmsubh
+            for (int i = 0; i < 4; ++i)
+            {
+                r.w[i] = static_cast<int32_t>(a.h[2 * i]) * b.h[2 * i] - static_cast<int32_t>(a.h[2 * i + 1]) * b.h[2 * i + 1];
+            }
+            break;
+        case 0x15: // phmsbh (HIM accumulator not modelled: treated as zero)
+            for (int i = 0; i < 4; ++i)
+            {
+                const int32_t sub = static_cast<int32_t>(a.h[2 * i + 1]) * b.h[2 * i + 1] - static_cast<int32_t>(a.h[2 * i]) * b.h[2 * i];
+                r.h[i] = static_cast<int16_t>(sub >> 16);
+            }
+            break;
+        case 0x1a: for (int i = 0; i < 8; ++i) r.h[i] = ((i & 1) == 0) ? b.h[i + 1] : b.h[i - 1]; break; // pexeh (even halfwords swapped)
+        case 0x1b: for (int i = 0; i < 8; ++i) r.h[i] = b.h[i ^ 1]; break; // prevh
+        case 0x1c: // pmulth
+            for (int i = 0; i < 4; ++i) r.w[i] = static_cast<int32_t>(static_cast<int64_t>(a.h[i] * b.h[i])); break;
+        case 0x1d: // pdivbw
+            for (int i = 0; i < 16; ++i)
+            {
+                const uint8_t den = static_cast<uint8_t>(b.b[i]);
+                r.b[i] = (den != 0u) ? static_cast<int8_t>(static_cast<uint8_t>(a.b[i]) / den) : 0;
+            }
+            break;
+        case 0x1e: r.w[0] = b.w[1]; r.w[1] = b.w[0]; r.w[2] = b.w[3]; r.w[3] = b.w[2]; break; // pexew
+        case 0x1f: r.w[0] = b.w[1]; r.w[1] = b.w[2]; r.w[2] = b.w[3]; r.w[3] = b.w[0]; break; // prot3w
+        default: handled = false; break;
+        }
+        if (handled) { finish(); return true; }
+        return false;
+    }
+
+    if (g == 0x29) // MMI3
+    {
+        switch (sa)
+        {
+        case 0x00: // pmadduw
+            for (int i = 0; i < 2; ++i)
+            {
+                const uint64_t p = static_cast<uint64_t>(static_cast<uint32_t>(a.w[2 * i])) * static_cast<uint32_t>(b.w[2 * i]) +
+                                   static_cast<uint64_t>(static_cast<uint32_t>(a.w[2 * i + 1])) * static_cast<uint32_t>(b.w[2 * i + 1]);
+                r.d[i] = p;
+            }
+            break;
+        case 0x03: for (int i = 0; i < 4; ++i) r.w[i] = a.w[i] >> (b.w[i] & 31u); break; // psravw
+        case 0x08: ctx->hi = static_cast<uint64_t>(static_cast<uint32_t>(b.w[0])); break; // pmthi
+        case 0x09: ctx->lo = static_cast<uint64_t>(static_cast<uint32_t>(b.w[0])); break; // pmtlo
+        case 0x0a: for (int i = 0; i < 4; ++i) { r.h[i + 4] = a.h[i]; r.h[i] = b.h[i]; } break; // pinteh (see note)
+        case 0x0c: // pmultuw
+            for (int i = 0; i < 2; ++i)
+            {
+                const uint64_t p = static_cast<uint64_t>(static_cast<uint32_t>(a.w[2 * i])) * static_cast<uint32_t>(b.w[2 * i]);
+                r.d[i] = p;
+            }
+            break;
+        case 0x0d: // pdivuw
+            for (int i = 0; i < 2; ++i)
+            {
+                const uint64_t num = a.d[i];
+                const uint32_t den = static_cast<uint32_t>(b.w[2 * i + 1]);
+                if (den != 0u) { r.d[i] = num / den; ctx->lo = num % den; }
+                else { r.d[i] = 0u; ctx->lo = num; }
+            }
+            break;
+        case 0x0e: r.d[0] = a.d[1]; r.d[1] = b.d[1]; break; // pcpyud
+        case 0x12: for (int i = 0; i < 16; ++i) r.b[i] = static_cast<int8_t>(a.b[i] | b.b[i]); break; // por
+        case 0x13: for (int i = 0; i < 16; ++i) r.b[i] = static_cast<int8_t>(~(a.b[i] | b.b[i])); break; // pnor
+        case 0x1a: for (int i = 0; i < 8; ++i) r.h[i] = b.h[i ^ 1]; break; // pexch
+        case 0x1b:
+        {
+            const int16_t v = b.h[3]; // PCPYH: replicate source halfword 3 into all lanes
+            for (int i = 0; i < 8; ++i) r.h[i] = v;
+            break;
+        }
+        case 0x1e: r.w[0] = b.w[1]; r.w[1] = b.w[0]; r.w[2] = b.w[3]; r.w[3] = b.w[2]; break; // pexcw
+        default: handled = false; break;
+        }
+        if (handled)
+        {
+            if (sa == 0x08 || sa == 0x09) { return true; } // pmthi/pmtlo write HI/LO only
+            finish();
+            return true;
+        }
+        return false;
+    }
+
+    // Top-level MMI functions (madd/plzcw/mfhi1/psllh/...).
+    switch (g)
+    {
+    case 0x00: case 0x01: case 0x02: case 0x03: // madd / maddu / msub / msubu
+    {
+        const int64_t x = static_cast<int64_t>(GPR_S32(ctx, f.rs));
+        const int64_t y = static_cast<int64_t>(GPR_S32(ctx, f.rt));
+        const uint64_t ux = GPR_U32(ctx, f.rs);
+        const uint64_t uy = GPR_U32(ctx, f.rt);
+        const bool unsign = (g == 0x01 || g == 0x03);
+        const bool subtract = (g >= 0x02);
+        const int64_t prod = unsign ? static_cast<int64_t>(ux * uy) : (unsign ? x * y : x * y);
+        const int64_t cur = static_cast<int64_t>(ctx->lo | (ctx->hi << 64));
+        const int64_t res = subtract ? (cur - prod) : (cur + prod);
+        ctx->lo = static_cast<uint64_t>(res);
+        ctx->hi = static_cast<uint64_t>(res) >> 63;
+        return true;
+    }
+    case 0x04: // plzcw
+    {
+        const Packed s = unpack128(GPR_VEC(ctx, f.rt));
+        for (int i = 0; i < 4; ++i)
+        {
+            const uint32_t v = static_cast<uint32_t>(s.w[i]);
+            int count = 0;
+            const bool zeroLead = (v & 0x80000000u) == 0u;
+            for (int bit = 31; bit >= 0; --bit)
+            {
+                const bool isZero = ((v >> bit) & 1u) == 0u;
+                if (isZero != zeroLead) break;
+                ++count;
+            }
+            r.w[i] = count;
+        }
+        finish();
+        return true;
+    }
+    case 0x10: SET_GPR_U64(ctx, f.rd, ctx->hi1); return true; // mfhi1
+    case 0x11: ctx->hi1 = GPR_U64(ctx, f.rt); return true;    // mthi1
+    case 0x12: SET_GPR_U64(ctx, f.rd, ctx->lo1); return true; // mflo1
+    case 0x13: ctx->lo1 = GPR_U64(ctx, f.rt); return true;    // mtlo1
+    case 0x18: case 0x19: // mult1 / multu1
+    {
+        const int64_t x = static_cast<int64_t>(GPR_S32(ctx, f.rs));
+        const int64_t y = static_cast<int64_t>(GPR_S32(ctx, f.rt));
+        const __int128 p = (g == 0x18) ? static_cast<__int128>(x) * y
+                                       : static_cast<__int128>(static_cast<__uint128_t>(GPR_U64(ctx, f.rs) & 0xffffffffull) * (GPR_U64(ctx, f.rt) & 0xffffffffull));
+        ctx->lo1 = static_cast<uint64_t>(p);
+        ctx->hi1 = static_cast<uint64_t>(p >> 64);
+        return true;
+    }
+    case 0x1a: case 0x1b: // div1 / divu1
+    {
+        if (g == 0x1a)
+        {
+            const int32_t d = GPR_S32(ctx, f.rs);
+            const int32_t n = GPR_S32(ctx, f.rt);
+            ctx->lo1 = (d != 0) ? static_cast<uint64_t>(static_cast<int64_t>(n / d)) : 0u;
+            ctx->hi1 = (d != 0) ? static_cast<uint64_t>(static_cast<int64_t>(n % d)) : static_cast<uint64_t>(n);
+        }
+        else
+        {
+            const uint32_t d = GPR_U32(ctx, f.rs);
+            const uint32_t n = GPR_U32(ctx, f.rt);
+            ctx->lo1 = (d != 0u) ? (n / d) : 0u;
+            ctx->hi1 = (d != 0u) ? (n % d) : n;
+        }
+        return true;
+    }
+    case 0x20: case 0x21: // madd1 / maddu1
+    {
+        const int64_t x = static_cast<int64_t>(GPR_S32(ctx, f.rs));
+        const int64_t y = static_cast<int64_t>(GPR_S32(ctx, f.rt));
+        const __int128 prod = (g == 0x20) ? static_cast<__int128>(x) * y
+                                          : static_cast<__int128>(static_cast<__uint128_t>(GPR_U64(ctx, f.rs) & 0xffffffffull) * (GPR_U64(ctx, f.rt) & 0xffffffffull));
+        const __int128 cur = static_cast<__int128>(static_cast<__uint128_t>(ctx->lo1) | (static_cast<__uint128_t>(ctx->hi1) << 64));
+        const __int128 res = cur + prod;
+        ctx->lo1 = static_cast<uint64_t>(res);
+        ctx->hi1 = static_cast<uint64_t>(res >> 64);
+        return true;
+    }
+    case 0x30: // pmfhl (sa selects the layout)
+    {
+        const Packed hi{unpack128(_mm_set1_epi32(static_cast<int32_t>(static_cast<uint32_t>(ctx->hi))))};
+        const Packed lo{unpack128(_mm_set1_epi32(static_cast<int32_t>(static_cast<uint32_t>(ctx->lo))))};
+        (void)hi; (void)lo;
+        Packed src{};
+        src.d[0] = ctx->lo;
+        src.d[1] = ctx->hi;
+        switch (sa)
+        {
+        case 0x10: r.w[0] = static_cast<int32_t>(static_cast<uint32_t>(ctx->lo)); r.w[1] = 0; r.w[2] = static_cast<int32_t>(static_cast<uint32_t>(ctx->hi)); r.w[3] = 0; break;
+        case 0x11: r.d[0] = ctx->lo; r.d[1] = ctx->hi; break;
+        case 0x18: for (int i = 0; i < 8; ++i) { r.h[i] = static_cast<int16_t>((i < 4) ? (ctx->lo >> (i * 16)) : (ctx->hi >> ((i - 4) * 16))); } break;
+        case 0x19: for (int i = 0; i < 8; ++i) { r.h[i] = static_cast<int16_t>((i < 4) ? (ctx->lo >> (i * 16)) : (ctx->hi >> ((i - 4) * 16))); } break;
+        default: return false;
+        }
+        (void)src;
+        finish();
+        return true;
+    }
+    case 0x31: // pmthl (mask select from rt into HI/LO)
+    {
+        uint64_t hi = ctx->hi;
+        uint64_t lo = ctx->lo;
+        const uint32_t m = sa & 0xff0u;
+        if ((m & 0x0f0u) == 0x0f0u) { lo = b.d[0]; }
+        if ((m & 0xf00u) == 0xf00u) { hi = b.d[1]; }
+        ctx->lo = lo;
+        ctx->hi = hi;
+        return true;
+    }
+    case 0x34: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(b.h[i] << (sa & 15u)); break;   // psllh
+    case 0x36: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(static_cast<uint16_t>(b.h[i]) >> (sa & 15u)); break; // psrlh
+    case 0x37: for (int i = 0; i < 8; ++i) r.h[i] = static_cast<int16_t>(b.h[i] >> (sa & 15u)); break;    // psrah
+    case 0x3C: for (int i = 0; i < 4; ++i) r.w[i] = static_cast<int32_t>(static_cast<uint32_t>(b.w[i]) << (sa & 31u)); break; // psllw
+    case 0x3E: for (int i = 0; i < 4; ++i) r.w[i] = static_cast<int32_t>(static_cast<uint32_t>(b.w[i]) >> (sa & 31u)); break; // psrlw
+    case 0x3F: for (int i = 0; i < 4; ++i) r.w[i] = b.w[i] >> (sa & 31u); break;                          // psraw
+    default:
+        return false;
+    }
+
+    finish();
+    return true;
+}
+
+// ---- one instruction -------------------------------------------------------
+
+struct Result
+{
+    Flow flow = Flow::Sequential;
+    uint32_t target = 0u;
+};
+
+static Result step(uint32_t insn, uint32_t pc, bool delaySlot, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    std::printf("[interp] step: 0x%08x @0x%08x\n", insn, pc);
+    Result r{};
+    const Field f = decode(insn);
+    const uint32_t link = pc + 8u;
+
+    auto setGprSext = [&](uint32_t reg, uint64_t v) { SET_GPR_U64(ctx, reg, v); };
+
+    switch (f.op)
+    {
+    case 0x00: // SPECIAL
+        switch (f.fn)
+        {
+        case 0x00: SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rt) << (f.sa & 31u)); break;
+        case 0x02: SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rt) >> (f.sa & 31u)); break;
+        case 0x03: SET_GPR_S32(ctx, f.rd, GPR_S32(ctx, f.rt) >> (f.sa & 31u)); break;
+        case 0x04: SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rt) << (GPR_U32(ctx, f.rs) & 31u)); break;
+        case 0x06: SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rt) >> (GPR_U32(ctx, f.rs) & 31u)); break;
+        case 0x07: SET_GPR_S32(ctx, f.rd, GPR_S32(ctx, f.rt) >> (GPR_U32(ctx, f.rs) & 31u)); break;
+        case 0x08: // jr
+            if (!delaySlot) { r.flow = Flow::Transfer; r.target = GPR_U32(ctx, f.rs); }
+            break;
+        case 0x09: // jalr
+        {
+            const uint32_t target = GPR_U32(ctx, f.rs);
+            if (f.rd != 0u) { SET_GPR_U32(ctx, f.rd, link); }
+            if (!delaySlot) { r.flow = Flow::Call; r.target = target; }
+            break;
+        }
+        case 0x0a: // movz
+            if (GPR_U32(ctx, f.rs) == 0u) { SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rt)); }
+            break;
+        case 0x0b: // movn
+            if (GPR_U32(ctx, f.rs) != 0u) { SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rt)); }
+            break;
+        case 0x0c: // syscall
+            ctx->pc = pc + 4u;
+            runtime->handleSyscall(rdram, ctx, 0u);
+            r.flow = Flow::Syscall;
+            break;
+        case 0x0d: // break
+            std::printf("[interp] break 0x%05x @0x%08x\n", (insn >> 6) & 0xfffffu, pc);
+            break;
+        case 0x0f: // sync
+            break;
+        case 0x10: SET_GPR_U64(ctx, f.rd, ctx->hi); break;   // mfhi (R5900)
+        case 0x11: ctx->hi = GPR_U64(ctx, f.rt); break;      // mthi (R5900)
+        case 0x12: SET_GPR_U64(ctx, f.rd, ctx->lo); break;   // mflo
+        case 0x13: ctx->lo = GPR_U64(ctx, f.rt); break;      // mtlo
+        case 0x14: SET_GPR_U64(ctx, f.rd, GPR_U64(ctx, f.rt) << (GPR_U64(ctx, f.rs) & 63u)); break;
+        case 0x16: SET_GPR_U64(ctx, f.rd, GPR_U64(ctx, f.rt) >> (GPR_U64(ctx, f.rs) & 63u)); break;
+        case 0x17: SET_GPR_U64(ctx, f.rd, static_cast<uint64_t>(static_cast<int64_t>(GPR_S64(ctx, f.rt)) >> (GPR_U64(ctx, f.rs) & 63u))); break;
+        case 0x18: // mult
+        {
+            const int64_t a = GPR_S64(ctx, f.rs);
+            const int64_t b = GPR_S64(ctx, f.rt);
+            const __int128 p = static_cast<__int128>(a) * static_cast<__int128>(b);
+            ctx->lo = static_cast<uint64_t>(p);
+            ctx->hi = static_cast<uint64_t>(p >> 64);
+            break;
+        }
+        case 0x19: // multu
+        {
+            const __uint128_t p = static_cast<__uint128_t>(GPR_U64(ctx, f.rs)) * static_cast<__uint128_t>(GPR_U64(ctx, f.rt));
+            ctx->lo = static_cast<uint64_t>(p);
+            ctx->hi = static_cast<uint64_t>(p >> 64);
+            break;
+        }
+        case 0x1a: // div
+        {
+            const int32_t d = GPR_S32(ctx, f.rs);
+            const int32_t n = GPR_S32(ctx, f.rt);
+            if (d != 0) { ctx->lo = static_cast<uint64_t>(static_cast<int64_t>(n / d)); ctx->hi = static_cast<uint64_t>(static_cast<int64_t>(n % d)); }
+            else { ctx->lo = 0u; ctx->hi = static_cast<uint64_t>(n); }
+            break;
+        }
+        case 0x1b: // divu
+        {
+            const uint32_t d = GPR_U32(ctx, f.rs);
+            const uint32_t n = GPR_U32(ctx, f.rt);
+            if (d != 0u) { ctx->lo = n / d; ctx->hi = n % d; }
+            else { ctx->lo = 0u; ctx->hi = n; }
+            break;
+        }
+        case 0x20: case 0x21: SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rs) + GPR_U32(ctx, f.rt)); break;
+        case 0x22: case 0x23: SET_GPR_U32(ctx, f.rd, GPR_U32(ctx, f.rs) - GPR_U32(ctx, f.rt)); break;
+        case 0x24: SET_GPR_VEC(ctx, f.rd, _mm_and_si128(GPR_VEC(ctx, f.rs), GPR_VEC(ctx, f.rt))); break;
+        case 0x25: SET_GPR_VEC(ctx, f.rd, _mm_or_si128(GPR_VEC(ctx, f.rs), GPR_VEC(ctx, f.rt))); break;
+        case 0x26: SET_GPR_VEC(ctx, f.rd, _mm_xor_si128(GPR_VEC(ctx, f.rs), GPR_VEC(ctx, f.rt))); break;
+        case 0x27: SET_GPR_VEC(ctx, f.rd, _mm_andnot_si128(GPR_VEC(ctx, f.rt), _mm_set1_epi32(-1))); break;
+        case 0x2a: SET_GPR_U32(ctx, f.rd, (GPR_S32(ctx, f.rs) < GPR_S32(ctx, f.rt)) ? 1u : 0u); break;
+        case 0x2b: SET_GPR_U32(ctx, f.rd, (GPR_U32(ctx, f.rs) < GPR_U32(ctx, f.rt)) ? 1u : 0u); break;
+        case 0x2d: setGprSext(f.rd, GPR_U64(ctx, f.rs) + GPR_U64(ctx, f.rt)); break; // daddu
+        case 0x2c: setGprSext(f.rd, static_cast<uint64_t>(static_cast<int64_t>(GPR_S64(ctx, f.rs) + GPR_S64(ctx, f.rt)))); break; // dadd
+        case 0x2e: case 0x2f: setGprSext(f.rd, GPR_U64(ctx, f.rs) - GPR_U64(ctx, f.rt)); break; // dsub/dsubu
+        case 0x38: setGprSext(f.rd, GPR_U64(ctx, f.rt) << (f.sa & 63u)); break;  // dsll
+        case 0x3a: setGprSext(f.rd, GPR_U64(ctx, f.rt) >> (f.sa & 63u)); break;  // dsrl
+        case 0x3b: setGprSext(f.rd, static_cast<uint64_t>(static_cast<int64_t>(GPR_S64(ctx, f.rt)) >> (f.sa & 63u))); break; // dsra
+        case 0x3c: setGprSext(f.rd, GPR_U64(ctx, f.rt) << f.sa); break;          // dsll32
+        case 0x3e: setGprSext(f.rd, GPR_U64(ctx, f.rt) >> f.sa); break;          // dsrl32
+        case 0x3f: setGprSext(f.rd, static_cast<uint64_t>(static_cast<int64_t>(GPR_S64(ctx, f.rt)) >> f.sa)); break; // dsra32
+        default:
+            g_unsupported.fetch_add(1u, std::memory_order_relaxed);
+            logUnsupportedOnce(pc, insn);
+            break;
+        }
+        break;
+
+    case 0x01: // REGIMM
+    {
+        const uint32_t target = pc + 4u + (static_cast<uint32_t>(f.simm) << 2u);
+        const int32_t v = GPR_S32(ctx, f.rs);
+        bool taken = false;
+        switch (f.rt)
+        {
+        case 0x00: case 0x02: case 0x10: case 0x12: taken = v < 0; break;               // bltz family
+        case 0x01: case 0x03: case 0x11: case 0x13: taken = v >= 0; break;              // bgez family
+        case 0x08: taken = v < 0; SET_GPR_U32(ctx, 31, link); break;                     // bltzal
+        case 0x09: taken = v >= 0; SET_GPR_U32(ctx, 31, link); break;                    // bgezal
+        case 0x0a: taken = v < 0; SET_GPR_U32(ctx, 31, link); break;                     // bltzall
+        case 0x0b: taken = v >= 0; SET_GPR_U32(ctx, 31, link); break;                    // bgezall
+        default:
+            // COP0-conditional branches (BC0*) and R5900 extensions: treat as
+            // not taken but record them, they only appear in kernel stubs.
+            g_unsupported.fetch_add(1u, std::memory_order_relaxed);
+            logUnsupportedOnce(pc, insn);
+            taken = false;
+            break;
+        }
+        if (taken && !delaySlot) { r.flow = Flow::Branch; r.target = target; }
+        break;
+    }
+
+    case 0x02: // j
+        if (!delaySlot) { r.flow = Flow::Transfer; r.target = ((pc & 0xf0000000u) | ((insn & 0x03ffffffu) << 2u)); }
+        break;
+    case 0x03: // jal
+        SET_GPR_U32(ctx, 31, link);
+        if (!delaySlot) { r.flow = Flow::Call; r.target = ((pc & 0xf0000000u) | ((insn & 0x03ffffffu) << 2u)); }
+        break;
+    case 0x04: case 0x14: // beq / beql
+        if (GPR_U32(ctx, f.rs) == GPR_U32(ctx, f.rt) && !delaySlot) { r.flow = Flow::Branch; r.target = pc + 4u + (static_cast<uint32_t>(f.simm) << 2u); }
+        break;
+    case 0x05: case 0x15: // bne / bnel
+        if (GPR_U32(ctx, f.rs) != GPR_U32(ctx, f.rt) && !delaySlot) { r.flow = Flow::Branch; r.target = pc + 4u + (static_cast<uint32_t>(f.simm) << 2u); }
+        break;
+    case 0x06: case 0x16: // blez / blezl
+        if (GPR_S32(ctx, f.rs) <= 0 && !delaySlot) { r.flow = Flow::Branch; r.target = pc + 4u + (static_cast<uint32_t>(f.simm) << 2u); }
+        break;
+    case 0x07: case 0x17: // bgtz / bgtzl
+        if (GPR_S32(ctx, f.rs) > 0 && !delaySlot) { r.flow = Flow::Branch; r.target = pc + 4u + (static_cast<uint32_t>(f.simm) << 2u); }
+        break;
+    case 0x08: SET_GPR_S32(ctx, f.rt, GPR_S32(ctx, f.rs) + f.simm); break;  // addi
+    case 0x09: SET_GPR_S32(ctx, f.rt, GPR_U32(ctx, f.rs) + f.uimm); break;  // addiu
+    case 0x0a: SET_GPR_U32(ctx, f.rt, (GPR_S32(ctx, f.rs) < f.simm) ? 1u : 0u); break;
+    case 0x0b: SET_GPR_U32(ctx, f.rt, (GPR_U32(ctx, f.rs) < static_cast<uint32_t>(f.simm)) ? 1u : 0u); break;
+    case 0x0c: SET_GPR_U32(ctx, f.rt, GPR_U32(ctx, f.rs) & f.uimm); break;
+    case 0x0d: SET_GPR_U32(ctx, f.rt, GPR_U32(ctx, f.rs) | f.uimm); break;
+    case 0x0e: SET_GPR_U32(ctx, f.rt, GPR_U32(ctx, f.rs) ^ f.uimm); break;
+    case 0x0f: SET_GPR_S32(ctx, f.rt, static_cast<uint32_t>(f.uimm) << 16u); break; // lui
+    case 0x18: setGprSext(f.rt, static_cast<uint64_t>(static_cast<int64_t>(f.simm))); break; // daddi
+    case 0x19: setGprSext(f.rt, static_cast<uint64_t>(static_cast<int64_t>(GPR_S64(ctx, f.rs) + f.simm))); break; // daddiu
+
+    case 0x10: // COP0
+        switch (f.rs)
+        {
+        case 0x00: SET_GPR_U32(ctx, f.rt, cop0Read(ctx, f.rd)); break;                       // mfc0
+        case 0x01: SET_GPR_U32(ctx, f.rt, cop0Read(ctx, f.rd)); break;                       // cfc0
+        case 0x04: cop0Write(ctx, f.rd, GPR_U32(ctx, f.rt)); break;                          // mtc0
+        case 0x05: cop0Write(ctx, f.rd, GPR_U32(ctx, f.rt)); break;                          // ctc0
+        case 0x10:
+            switch (f.fn)
+            {
+            case 0x18: ctx->pc = ctx->cop0_epc; r.flow = Flow::Transfer; r.target = ctx->cop0_epc; break; // eret
+            case 0x3e: ctx->cop0_status &= ~0x1u; break;                                      // di
+            case 0x3f: ctx->cop0_status |= 0x1u; break;                                       // ei
+            default: g_unsupported.fetch_add(1u, std::memory_order_relaxed); logUnsupportedOnce(pc, insn); break;
+            }
+            break;
+        default: g_unsupported.fetch_add(1u, std::memory_order_relaxed); logUnsupportedOnce(pc, insn); break;
+        }
+        break;
+
+    case 0x11: // COP1
+    {
+        const uint32_t fmt = f.rs;
+        auto fsrc1 = [&](uint32_t idx) { return ctx->f[idx]; };
+        auto fsrc2 = [&](uint32_t idx) { return ctx->f[idx]; };
+        if (fmt == 0x00) { ctx->f[f.rd] = __builtin_bit_cast(float, GPR_U32(ctx, f.rt)); }            // mfc1
+        else if (fmt == 0x02) { SET_GPR_U32(ctx, f.rt, __builtin_bit_cast(uint32_t, ctx->f[f.rd])); }  // cfc1
+        else if (fmt == 0x04) { ctx->f[f.rd] = GPR_U32(ctx, f.rt); }                                    // mtc1
+        else if (fmt == 0x06) { ctx->fcr31 = GPR_U32(ctx, f.rt); }                                       // ctc1
+        else if (fmt == 0x08)                                                                                   // bc1*
+        {
+            const bool taken = ((f.rt & 1u) == 0u) ? (fpuCond(ctx) == 0u) : (fpuCond(ctx) != 0u);
+            if (taken && !delaySlot) { r.flow = Flow::Branch; r.target = pc + 4u + (static_cast<uint32_t>(f.simm) << 2u); }
+        }
+        else if (fmt == 0x10 || fmt == 0x11 || fmt == 0x14 || fmt == 0x15)
+        {
+            // RR-style: destination is fd (bits 10-6) except the R5900 C.MUL.S
+            // variant, which encodes its destination in the rd field.
+            const uint32_t fd = (f.fn == 0x02u && (fmt == 0x10u || fmt == 0x14u)) ? f.rd : f.sa;
+            const float a = fsrc1(f.rt);
+            const float b = fsrc2(f.rd);
+            switch (f.fn)
+            {
+            case 0x00: ctx->f[fd] = a + b; break;
+            case 0x01: ctx->f[fd] = a - b; break;
+            case 0x02: ctx->f[fd] = a * b; break;
+            case 0x03: ctx->f[fd] = (b != 0.0f) ? (a / b) : 0.0f; break;
+            case 0x04: ctx->f[fd] = std::sqrt(std::fabs(a)); break;
+            case 0x05: ctx->f[fd] = std::fabs(a); break;
+            case 0x06: ctx->f[fd] = a; break;
+            case 0x07: ctx->f[fd] = -a; break;
+            case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+            {
+                const uint32_t condOp = f.fn & 7u;
+                bool res = false;
+                switch (condOp)
+                {
+                case 0x00: res = (a == b); break;
+                case 0x01: res = (a != b); break;
+                case 0x02: res = (a < b); break;
+                case 0x03: res = (a <= b); break;
+                case 0x04: res = (a ? 0u : 0u, false); break; // NaN checks not modelled
+                case 0x05: res = !(a == b); break;
+                case 0x06: res = !(a < b); break;
+                case 0x07: res = !(a <= b); break;
+                }
+                if ((f.fn & 0x08u) == 0u) { setFpuCond(ctx, res ? 1u : 0u); } else { setFpuCond(ctx, res ? 0u : 1u); }
+                break;
+            }
+            default: g_unsupported.fetch_add(1u, std::memory_order_relaxed); logUnsupportedOnce(pc, insn); break;
+            }
+        }
+        else if (fmt == 0x14 || fmt == 0x15 || fmt == 0x18 || fmt == 0x19 || fmt == 0x1c || fmt == 0x1d)
+        {
+            // conversion / rounding group
+            const uint32_t fd = f.sa;
+            const uint32_t fs = f.rd;
+            const float v = ctx->f[fs];
+            switch (f.fn)
+            {
+            case 0x20: ctx->f[fd] = std::trunc(v); break;      // trunc
+            case 0x21: ctx->f[fd] = std::floor(v); break;      // floor
+            case 0x24: ctx->f[fd] = std::roundf(v); break;     // round
+            case 0x25: ctx->f[fd] = std::ceil(v); break;       // ceil
+            case 0x26: ctx->f[fd] = std::nearbyint(v); break;  // rint
+            default:
+                if (f.fn == 0x27) { ctx->f[fd] = std::trunc(v); } // fix
+                else { g_unsupported.fetch_add(1u, std::memory_order_relaxed); logUnsupportedOnce(pc, insn); }
+                break;
+            }
+            if (f.fn == 0x00) { SET_GPR_U32(ctx, f.rt, static_cast<uint32_t>(static_cast<int32_t>(v))); } // cvt.w.s -> handled below
+        }
+        else
+        {
+            g_unsupported.fetch_add(1u, std::memory_order_relaxed);
+            logUnsupportedOnce(pc, insn);
+        }
+        break;
+    }
+
+    case 0x1c: // R5900 MMI group (padduw, pand, pcpyld, pcpyh, ...)
+        std::printf("[interp] MMI dispatch for 0x%08x @0x%08x\n", insn, pc);
+        if (!mmiExecute(f, ctx))
+        {
+            g_unsupported.fetch_add(1u, std::memory_order_relaxed);
+            logUnsupportedOnce(pc, insn);
+        }
+        break;
+    case 0x1d: // R5900 SIMD float / EIE group
+        std::printf("[interp] unsupported SIMD float/EIE 0x%08x @0x%08x\n", insn, pc);
+        g_unsupported.fetch_add(1u, std::memory_order_relaxed);
+        logUnsupportedOnce(pc, insn);
+        break;
+
+    case 0x12: case 0x13: // COP2 / COP3 (VU0 macro)
+        g_unsupported.fetch_add(1u, std::memory_order_relaxed);
+        logUnsupportedOnce(pc, insn);
+        break;
+
+    case 0x1e: // lq
+        SET_GPR_VEC(ctx, f.rt, runtime->Load128(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm)));
+        break;
+    case 0x1f: // sq
+        runtime->Store128(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_VEC(ctx, f.rt));
+        break;
+    case 0x2f: // lq (R5900 alias)
+        SET_GPR_VEC(ctx, f.rt, runtime->Load128(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm)));
+        break;
+    case 0x3f: // sq (R5900 alias)
+        runtime->Store128(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_VEC(ctx, f.rt));
+        break;
+
+    case 0x20: SET_GPR_S32(ctx, f.rt, static_cast<int32_t>(static_cast<int8_t>(runtime->Load8(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm))))); break;   // lb
+    case 0x21: SET_GPR_S32(ctx, f.rt, static_cast<int32_t>(static_cast<int16_t>(runtime->Load16(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm))))); break;   // lh
+    case 0x22: SET_GPR_U32(ctx, f.rt, lwlValue(rdram, ctx, runtime, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U32(ctx, f.rt))); break; // lwl
+    case 0x23: SET_GPR_S32(ctx, f.rt, runtime->Load32(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm))); break;                                                          // lw
+    case 0x24: SET_GPR_U32(ctx, f.rt, runtime->Load8(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm))); break;                                                            // lbu
+    case 0x25: SET_GPR_U32(ctx, f.rt, runtime->Load16(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm))); break;                                                           // lhu
+    case 0x26: SET_GPR_U32(ctx, f.rt, lwrValue(rdram, ctx, runtime, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U32(ctx, f.rt))); break; // lwr
+    case 0x27: SET_GPR_U32(ctx, f.rt, runtime->Load32(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm))); break; // lwu
+    case 0x28: runtime->Store8(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), static_cast<uint8_t>(GPR_U32(ctx, f.rt))); break; // sb
+    case 0x29: runtime->Store16(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), static_cast<uint16_t>(GPR_U32(ctx, f.rt))); break; // sh
+    case 0x2a: swlStore(rdram, ctx, runtime, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U32(ctx, f.rt)); break; // swl
+    case 0x2b: runtime->Store32(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U32(ctx, f.rt)); break; // sw
+    case 0x2c: sdlStore(rdram, ctx, runtime, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U64(ctx, f.rt)); break; // sdl
+    case 0x2e: swrStore(rdram, ctx, runtime, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U32(ctx, f.rt)); break; // swr
+    case 0x31: ctx->f[f.rt] = __builtin_bit_cast(float, runtime->Load32(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm))); break; // lwc1
+    case 0x39: runtime->Store32(rdram, ctx, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), __builtin_bit_cast(uint32_t, ctx->f[f.rt])); break; // swc1
+    case 0x37: SET_GPR_U64(ctx, f.rt, ldlValue(rdram, ctx, runtime, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U64(ctx, f.rt))); break; // ldl
+    case 0x3f: sdrStore(rdram, ctx, runtime, GPR_U32(ctx, f.rs) + static_cast<uint32_t>(f.simm), GPR_U64(ctx, f.rt)); break;     // sdr
+    default:
+        g_unsupported.fetch_add(1u, std::memory_order_relaxed);
+        logUnsupportedOnce(pc, insn);
+        break;
+    }
+
+    return r;
+}
+
+// ---- public API ------------------------------------------------------------
+
+void runThunk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    uint32_t pc = ctx->pc;
+
+    for (uint32_t executed = 0u; executed < kMaxInsnsPerThunk; ++executed)
+    {
+        if (pc == 0u || runtime->isStopRequested())
+        {
+            ctx->pc = pc;
+            return;
+        }
+
+        // Hand control straight back to the recompiled code as soon as the PC
+        // reaches an address that has a table entry.
+        if (executed > 0u && runtime->hasFunction(pc))
+        {
+            ctx->pc = pc;
+            return;
+        }
+
+        ctx->pc = pc;
+        const uint32_t insn = runtime->Load32(rdram, ctx, pc);
+        g_interpreted.fetch_add(1u, std::memory_order_relaxed);
+        Result r = step(insn, pc, false, rdram, ctx, runtime);
+
+        if (r.flow == Flow::Sequential)
+        {
+            pc += 4u;
+            continue;
+        }
+        if (r.flow == Flow::Syscall)
+        {
+            pc = ctx->pc;
+            continue;
+        }
+        if (r.flow == Flow::Stop)
+        {
+            ctx->pc = pc;
+            return;
+        }
+
+        // Branch/Call/Transfer: execute the delay slot first, then move.
+        const uint32_t delayAddr = pc + 4u;
+        const uint32_t delayInsn = runtime->Load32(rdram, ctx, delayAddr);
+        g_interpreted.fetch_add(1u, std::memory_order_relaxed);
+        const Result delayResult = step(delayInsn, delayAddr, true, rdram, ctx, runtime);
+        if (delayResult.flow == Flow::Syscall)
+        {
+            pc = ctx->pc;
+            continue;
+        }
+
+        if (r.flow == Flow::Branch)
+        {
+            pc = r.target;
+            continue;
+        }
+
+        if (r.flow == Flow::Call)
+        {
+            if (runtime->hasFunction(r.target))
+            {
+                const uint32_t returnAddr = GPR_U32(ctx, 31);
+                PS2Runtime::RecompiledFunction fn = runtime->lookupFunction(r.target);
+                ctx->pc = r.target;
+                fn(rdram, ctx, runtime);
+                if (runtime->isStopRequested())
+                {
+                    return;
+                }
+                // A callee that fell through returns to our link address; a
+                // callee that jumped elsewhere leaves its new PC behind.
+                pc = (ctx->pc == 0u || ctx->pc == r.target) ? returnAddr : ctx->pc;
+                continue;
+            }
+            pc = r.target;
+            continue;
+        }
+
+        // Flow::Transfer - let the normal dispatcher pick up the new PC.
+        ctx->pc = r.target;
+        return;
+    }
+
+    std::printf("[interp] budget exhausted at 0x%08x (interpreted=%llu)\n", pc,
+                static_cast<unsigned long long>(g_interpreted.load(std::memory_order_relaxed)));
+    std::fflush(stdout);
+    ctx->pc = pc;
+}
+
+uint64_t interpretedInstructions() { return g_interpreted.load(std::memory_order_relaxed); }
+uint64_t unsupportedInstructions() { return g_unsupported.load(std::memory_order_relaxed); }
+void resetCounters()
+{
+    g_interpreted.store(0u, std::memory_order_relaxed);
+    g_unsupported.store(0u, std::memory_order_relaxed);
+}
+} // namespace ps2_ee_interpreter
